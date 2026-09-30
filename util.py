@@ -3,6 +3,7 @@
 import glob
 import hashlib
 import gzip
+import io
 import json
 import os
 import re
@@ -52,7 +53,16 @@ def zstd_decompress(data: bytes) -> bytes:
     if _stdlib_zstd is not None:
         return _stdlib_zstd.decompress(data)
     if _zstandard is not None:
-        return _zstandard.ZstdDecompressor().decompress(data)
+        decompressor = _zstandard.ZstdDecompressor()
+        try:
+            return decompressor.decompress(data)
+        except _zstandard.ZstdError as exc:
+            # Codex sends zstd frames without an embedded content size. The
+            # one-shot API rejects those unless max_output_size is known.
+            if "content size" not in str(exc):
+                raise
+            with decompressor.stream_reader(io.BytesIO(data)) as reader:
+                return reader.read()
     raise RuntimeError("zstd support requires Python 3.14+ or the zstandard package")
 
 

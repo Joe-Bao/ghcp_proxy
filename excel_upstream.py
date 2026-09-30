@@ -216,13 +216,29 @@ def local_model_payload(model_id: str) -> dict[str, object]:
     }
 
 
-def _enabled_local_model_ids(records: dict[str, dict] | None) -> tuple[str, ...]:
-    """Return local aliases allowed by the upstream model records.
+def _excel_session_allows_local_models() -> bool:
+    """A signed-in Excel add-in session is enough to advertise the aliases.
 
-    Every Excel alias requires a matching upstream model record. This prevents
-    the proxy from advertising an Excel route when the account has not unlocked
-    its corresponding upstream model.
+    Copilot's /models list is a second source of entitlement. Excel-only
+    setups never receive that list, so requiring it hides the only models
+    the picker can actually route.
     """
+    try:
+        status = excel_session_store.status()
+    except Exception:
+        return False
+    return bool(status.get("configured")) and not bool(status.get("expired"))
+
+
+def _enabled_local_model_ids(records: dict[str, dict] | None) -> tuple[str, ...]:
+    """Return local aliases allowed by the Excel session or upstream records.
+
+    Without an Excel session, every alias still requires a matching upstream
+    model record. This prevents the proxy from advertising an Excel route
+    when the account has not unlocked its corresponding upstream model.
+    """
+    if _excel_session_allows_local_models():
+        return MODEL_IDS
     source = records if isinstance(records, dict) else {}
     enabled: list[str] = []
     for model_id in MODEL_IDS:

@@ -3838,6 +3838,9 @@ async def models_response() -> Response:
         client = await _get_client()
         models = await client.list_models()
     except Exception as exc:
+        payload = excel_upstream.merge_local_models_payload({})
+        if payload.get("data"):
+            return JSONResponse(payload)
         return format_translation.openai_error_response(502, f"Copilot SDK: {exc}")
     data = [
         {

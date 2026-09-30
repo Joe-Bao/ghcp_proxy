@@ -2148,5 +2148,62 @@ class ExcelSessionPersistenceTests(unittest.TestCase):
             )
 
 
+class ExcelHoldHeartbeatTests(unittest.TestCase):
+    def _drain(self, inner, *, heartbeat_seconds=None):
+        import proxy as proxy_module
+
+        async def run():
+            chunks = []
+            async for chunk in proxy_module._inject_hold_heartbeats(inner):
+                chunks.append(chunk)
+            return chunks
+
+        if heartbeat_seconds is None:
+            return asyncio.run(run())
+        original = proxy_module._EXCEL_HOLD_HEARTBEAT_SECONDS
+        proxy_module._EXCEL_HOLD_HEARTBEAT_SECONDS = heartbeat_seconds
+        try:
+            return asyncio.run(run())
+        finally:
+            proxy_module._EXCEL_HOLD_HEARTBEAT_SECONDS = original
+
+    def test_fast_stream_is_forwarded_without_heartbeats(self):
+        async def source():
+            yield b"event: response.created\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\n"
+            yield b"event: response.completed\ndata: {\"response\":{\"id\":\"resp_1\"}}\n\n"
+
+        chunks = self._drain(source())
+
+        self.assertEqual(len(chunks), 2)
+        self.assertNotIn(b"response.in_progress", b"".join(chunks))
+
+    def test_silent_hold_injects_heartbeat_then_delivers_next_chunk(self):
+        async def source():
+            yield b"event: response.created\ndata: {\"response\":{\"id\":\"resp_hb\"}}\n\n"
+            await asyncio.sleep(0.05)
+            yield b"event: response.completed\ndata: {\"response\":{\"id\":\"resp_hb\"}}\n\n"
+
+        chunks = self._drain(source(), heartbeat_seconds=0.01)
+        joined = b"".join(chunks)
+
+        # The transform stayed silent long enough for at least one heartbeat,
+        # and the final upstream chunk was still delivered afterwards.
+        self.assertIn(b"response.in_progress", joined)
+        self.assertIn(b"response.completed", joined)
+        heartbeat = next(c for c in chunks if b"response.in_progress" in c)
+        self.assertIn(b"resp_hb", heartbeat)
+
+    def test_heartbeat_before_any_snapshot_has_no_response_body(self):
+        async def source():
+            await asyncio.sleep(0.05)
+            yield b"event: response.created\ndata: {\"response\":{\"id\":\"resp_late\"}}\n\n"
+
+        chunks = self._drain(source(), heartbeat_seconds=0.01)
+
+        heartbeat = next(c for c in chunks if b"response.in_progress" in c)
+        payload = json.loads(heartbeat.decode().split("data:", 1)[1].strip())
+        self.assertEqual(payload, {"type": "response.in_progress"})
+
+
 if __name__ == "__main__":
     unittest.main()

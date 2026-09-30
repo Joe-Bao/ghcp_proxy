@@ -714,19 +714,24 @@ def _build_upstream_client(
         max_keepalive_connections=4,
         keepalive_expiry=300.0,
     )
+    verify = (
+        copilot_sdk_upstream._runtime_ssl_context()
+        if tls_verify is True
+        else tls_verify
+    )
     try:
         return httpx.AsyncClient(
             http2=upstream_http2,
             timeout=timeout,
             limits=limits,
-            verify=tls_verify,
+            verify=verify,
             trust_env=True,
         )
     except (ImportError, RuntimeError):
         return httpx.AsyncClient(
             timeout=timeout,
             limits=limits,
-            verify=tls_verify,
+            verify=verify,
             trust_env=True,
         )
 
@@ -959,16 +964,18 @@ except Exception as _sdk_ingest_exc:  # pragma: no cover - best effort
 @app.on_event("startup")
 async def _app_startup_restore_client_proxy_configs():
     excel_upstream.excel_session_store.load()
-    asyncio.create_task(asyncio.to_thread(
+    # The Codex catalog is rewritten during startup restore. Read the Excel
+    # session first, or that rewrite drops the Excel aliases.
+    await asyncio.to_thread(
         excel_session_capture.refresh_macos_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    ))
-    asyncio.create_task(asyncio.to_thread(
+    )
+    await asyncio.to_thread(
         excel_session_capture.refresh_windows_excel_session,
         excel_upstream.excel_session_store,
         force=True,
-    ))
+    )
     restore_client_proxy_configs_on_startup()
     auto_update_runtime_controller.start_periodic_checks()
 
@@ -5937,6 +5944,95 @@ def _excel_tool_call_event_bytes(
     ]
 
 
+def _excel_stream_response_snapshot(chunk: bytes) -> dict | None:
+    """Extract the ``response`` object from a forwarded created/in_progress event.
+
+    The heartbeat reuses the upstream response identity so the injected
+    ``response.in_progress`` events line up with the real stream instead of
+    inventing an id Codex has never seen.
+    """
+    try:
+        text = chunk.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    if "response.created" not in text and "response.in_progress" not in text:
+        return None
+    for line in text.split("\n"):
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict) and isinstance(payload.get("response"), dict):
+            return payload["response"]
+    return None
+
+
+def _excel_heartbeat_bytes(response_snapshot: dict | None) -> bytes:
+    payload: dict[str, object] = {"type": "response.in_progress"}
+    if isinstance(response_snapshot, dict):
+        payload["response"] = response_snapshot
+    return format_translation.sse_encode("response.in_progress", payload)
+
+
+# Codex disconnects a Responses stream after ~300s without an SSE event. The
+# Excel tool-stream transform holds native tool-call events until it can decide
+# how to rewrite them, so a long tool-argument generation produces no output for
+# minutes and trips that idle timeout, which then retries the turn from scratch.
+# A real JSON event resets the timer (an SSE comment does not), so inject
+# ``response.in_progress`` whenever the transform has been silent this long.
+_EXCEL_HOLD_HEARTBEAT_SECONDS = 20.0
+
+
+async def _inject_hold_heartbeats(inner):
+    """Emit ``response.in_progress`` while the wrapped transform stays silent.
+
+    The inner transform's ``__anext__`` is never cancelled on timeout, so its
+    generator state is preserved: the same pending pull is awaited again after
+    each heartbeat. Only teardown cancels the pull and closes the transform.
+    """
+    iterator = inner.__aiter__()
+    pending: asyncio.Future | None = None
+    response_snapshot: dict | None = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+            done, _ = await asyncio.wait(
+                {pending}, timeout=_EXCEL_HOLD_HEARTBEAT_SECONDS
+            )
+            if not done:
+                yield _excel_heartbeat_bytes(response_snapshot)
+                continue
+            task, pending = pending, None
+            try:
+                chunk = task.result()
+            except StopAsyncIteration:
+                return
+            if response_snapshot is None:
+                snapshot = _excel_stream_response_snapshot(chunk)
+                if snapshot is not None:
+                    response_snapshot = snapshot
+            yield chunk
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, Exception):
+                pass
+        close_inner = getattr(iterator, "aclose", None)
+        if callable(close_inner):
+            try:
+                await close_inner()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
 def _excel_tool_stream_transform(source_body: dict):
     allowed_tools = excel_upstream.client_tool_types(source_body)
     if not allowed_tools:
@@ -6136,7 +6232,10 @@ def _excel_tool_stream_transform(source_body: dict):
         if done_seen:
             yield b"data: [DONE]\n\n"
 
-    return transform
+    def transform_with_heartbeat(byte_iter):
+        return _inject_hold_heartbeats(transform(byte_iter))
+
+    return transform_with_heartbeat
 
 
 async def _read_excel_non_streaming_response_payload(
